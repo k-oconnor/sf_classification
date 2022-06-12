@@ -1,0 +1,343 @@
+---
+title: "State Farm Classification Exercise Executive Summary"
+author: "Kevin O'Connor"
+date: '2022-06-03'
+output: pdf_document
+---
+
+# Abstract
+
+For this project, I was tasked with performing some fundamental model building on a set of nondescript and messy data consisting of 100 unlabeled variables and a binary target variable each with 40,000 observations. After pre-processing and cleaning the data, I was instructed to make two models, and generate predictions on a validation data-set of the same variables over 10,000 additional observations.
+
+The models utilized are simple logit and gradient boosting machine models. The logit model is computationally inexpensive, flexible, and consistent. The gradient boosting model is a tree-based ensemble technique that typically will provide greater predictive power that a linear model, at a cost of computation time and the time spent tuning hyper-parameters. I will make the case that the GBM model is superior.
+
+```{r setup, include=FALSE, show = FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+```{r Loading Libraries, echo=FALSE, message=FALSE, warning=FALSE, show=FALSE}
+library(tidyverse)
+library(dplyr)
+library(mosaic)
+library(foreach)
+library(kableExtra)
+library(mice)
+library(rsample)
+library(ROCR)
+library(caret)
+library(pROC)
+library(gbm)
+```
+
+# Data Cleaning and Feature Engineering (1)
+
+The data-set has quite a few "NA" values across columns. Most columns with missing data appear to have missing values at random (MCAR), with a few exceptions. Typical approaches are to replace "NA" values with the mean of the feature in question, or with the most common value. I do not recommend the latter without intuition to back up the imputation, as this can easily introduce bias. The former is a simple, safe, and computationally inexpensive way to impute data, but we can do better.
+
+```{r 1a, message=FALSE, warning=FALSE, include=FALSE, show=FALSE}
+sf_validation = read_csv("exercise_40_test.csv")
+sf_base = read_csv("exercise_40_train.csv")
+```
+
+```{r 1b, echo=FALSE, message=FALSE, warning=FALSE}
+base_df = as.data.frame(sf_base)
+valid_df = as.data.frame(sf_validation)
+na_col= as.data.frame(colSums(is.na(base_df)))
+kable(head(na_col))
+
+```
+
+For the majority of the missing values, we will impute utilizing the "mice" package. Multiple imputation using fully conditional specification implemented by the MICE algorithm as described in Van Buuren and Groothuis-Oudshoorn (2011).The mice package allows us to perform sophisticated imputation methods with very simple code. Initially, I tried to run the models by imputing the mean for numeric variables, and the most common for categorical variables, with AUC maxing out \~.77. The mice package will run regressions on each variable, and impute data based on what it predicts the value to be.
+
+First, we address some low hanging fruit. Some variables are so sparse that they likely won't add higher fidelity to our models. In particular "x30", "x44", and "x57" have majority missing values. "x39" has only one level, I.E, no variation. We will exclude these variables entirely. There are some inconsistencies with "x3", where days are sometimes abbreviated. We need to make these day labels consistent. Also, there are two variables that have white space or symbols preceding the value. So, we substitute out the non-numeric characters.
+
+```{r 1c, message=FALSE, warning=FALSE}
+
+# Removing unreliable features
+base_df = subset(base_df, select = -c(x30,x39,x44,x57))
+valid_df = subset(valid_df, select = -c(x30,x39,x44,x57))
+
+# Making the "day" labels consistent (training)
+base_df$x3[base_df$x3 == "Mon"] = "Monday"
+base_df$x3[base_df$x3 == "Tue"] = "Tuesday"
+base_df$x3[base_df$x3 == "Wed"] = "Wednesday"
+base_df$x3[base_df$x3 == "Thur"] = "Thursday"
+base_df$x3[base_df$x3 == "Fri"] = "Friday"
+base_df$x3[base_df$x3 == "Sat"] = "Saturday"
+base_df$x3[base_df$x3 == "Sun"] = "Sunday"
+
+# Making the "day" labels consistent (testing)
+valid_df$x3[valid_df$x3 == "Mon"] = "Monday"
+valid_df$x3[valid_df$x3 == "Tue"] = "Tuesday"
+valid_df$x3[valid_df$x3 == "Wed"] = "Wednesday"
+valid_df$x3[valid_df$x3 == "Thur"] = "Thursday"
+valid_df$x3[valid_df$x3 == "Fri"] = "Friday"
+valid_df$x3[valid_df$x3 == "Sat"] = "Saturday"
+valid_df$x3[valid_df$x3 == "Sun"] = "Sunday"
+
+
+# Dealing with characters in two variables (training)
+base_df$x7 = as.numeric(sub("%", "", base_df$x7))/100
+base_df$x19 = as.numeric(gsub("\\$", "", base_df$x19))
+
+# Dealing with characters in two variables (testing)
+valid_df$x7 = as.numeric(sub("%", "", valid_df$x7))/100
+valid_df$x19 = as.numeric(gsub("\\$", "", valid_df$x19))
+
+
+
+ #mice algorithm with 1 imputation (training)
+base_df = mice(base_df,m=1,method = "cart")
+base_df = complete(base_df,1)
+
+ #mice algorithm with 1 imputation (testing)
+valid_df = mice(valid_df,m=1,method = "cart")
+valid_df = complete(valid_df,1)
+
+# Imputing categoricals without bias (training)
+base_df$x24 = base_df$x24 %>% replace_na('unknown')
+base_df$x33 = base_df$x33 %>% replace_na('unkwon')
+base_df$x77 = base_df$x77 %>% replace_na('unknown')
+base_df$x99 = base_df$x99 %>% replace_na('no')
+
+# Imputing categoricals without bias (testing)
+valid_df$x24 = valid_df$x24 %>% replace_na('unknown')
+valid_df$x33 = valid_df$x33 %>% replace_na('unkwon')
+valid_df$x77 = valid_df$x77 %>% replace_na('unknown')
+valid_df$x99 = valid_df$x99 %>% replace_na('no')
+ 
+```
+
+Next, are categorical variables, such as gender, auto-maker, and state. We will code these "as.factor", assigning numeric levels to the categories. This is quite a bit cleaner than one-hot encoding. Lastly, there is a great deal of variation between variables in each column. So, I z-score the numeric variables such that the models don't incorrectly weigh the value of one variable over another. The last step before we begin modeling, is to split the testing data into model training and model testing sets.
+
+```{r 1d, message=FALSE, warning=FALSE}
+
+# Encoding binary categoricals (training)
+base_df$x24 = ifelse(base_df$x24 == "male", 1, 0)
+base_df$x31 = ifelse(base_df$x31 == "yes", 1, 0)
+base_df$x93 = ifelse(base_df$x93 == "yes", 1, 0)
+base_df$x99 = ifelse(base_df$x99 == "yes", 1, 0)
+
+# Encoding binary categoricals (testing)
+valid_df$x24 = ifelse(valid_df$x24 == "male", 1, 0)
+valid_df$x31 = ifelse(valid_df$x31 == "yes", 1, 0)
+valid_df$x93 = ifelse(valid_df$x93 == "yes", 1, 0)
+valid_df$x99 = ifelse(valid_df$x99 == "yes", 1, 0)
+
+
+# Setting factor levels for categorical variables (training)
+base_df$x3 = as.factor(base_df$x3)
+base_df$x24 = as.factor(base_df$x24)
+base_df$x31 = as.factor(base_df$x31)
+base_df$x33 = as.factor(base_df$x33)
+base_df$x60 = as.factor(base_df$x60)
+base_df$x65 = as.factor(base_df$x65)
+base_df$x77 = as.factor(base_df$x77)
+base_df$x93 = as.factor(base_df$x93)
+base_df$x98 = as.factor(base_df$x98)
+base_df$x99 = as.factor(base_df$x99)
+
+# Setting factor levels for categorical variables (testing)
+valid_df$x3 = as.factor(valid_df$x3)
+valid_df$x24 = as.factor(valid_df$x24)
+valid_df$x31 = as.factor(valid_df$x31)
+valid_df$x33 = as.factor(valid_df$x33)
+valid_df$x60 = as.factor(valid_df$x60)
+valid_df$x65 = as.factor(valid_df$x65)
+valid_df$x77 = as.factor(valid_df$x77)
+valid_df$x93 = as.factor(valid_df$x93)
+valid_df$x98 = as.factor(valid_df$x98)
+valid_df$x99 = as.factor(valid_df$x99)
+
+
+# Normalizing the numeric data (training)
+base_df[2:3] = scale(base_df[2:3])
+base_df[5:24] = scale(base_df[5:24])
+base_df[26:30] = scale(base_df[26:30])
+base_df[32] = scale(base_df[32])
+base_df[34:55] = scale(base_df[34:55])
+base_df[58:61] = scale(base_df[58:61])
+base_df[63:73] = scale(base_df[63:73])
+base_df[75:89] = scale(base_df[75:89])
+base_df[91:94] = scale(base_df[91:94])
+base_df[97] = scale(base_df[97])
+
+# Normalizing the numeric data (testing)
+valid_df[1:2] = scale(valid_df[1:2])
+valid_df[4:23] = scale(valid_df[4:23])
+valid_df[25:29] = scale(valid_df[25:29])
+valid_df[31] = scale(valid_df[31])
+valid_df[33:54] = scale(valid_df[33:54])
+valid_df[57:60] = scale(valid_df[57:60])
+valid_df[62:72] = scale(valid_df[62:72])
+valid_df[74:88] = scale(valid_df[74:88])
+valid_df[90:93] = scale(valid_df[90:93])
+valid_df[96] = scale(valid_df[96])
+
+
+# Performing the initial train/test split
+x = initial_split(base_df, prop = 0.8)
+base_train = training(x)
+base_test = testing(x)
+```
+
+# Logistic Regression Model (2)
+
+## Model Specification
+For the logit model, I choose the most simple implementation. The target binary indicator is modeled against every covariate we selected in the cleaning stage. 
+
+```{r 2a, message=FALSE, warning=FALSE}
+
+# Running the model with all covariates selected
+base_logit = glm(y ~ ., data = base_train)
+
+# Generating predictions against the testing data
+log_pred =predict(base_logit,newdata=base_test, type = "response")
+
+# Intializing the confusion matrix
+confusion_table = data.frame(fold_id=integer(),TPR=integer(),FPR=integer())
+
+# Isolating target variable
+y = base_test$y
+
+# Looping across the sequence to generate receiving operater characteristic curve
+level = seq(-.1,.5,by=.02)
+confusion_level=foreach(x=level)%do%{
+  
+yhat_test = ifelse(log_pred > x,1,0)
+confusion_out = table(y=y, yhat = yhat_test)
+TPR = (confusion_out[2,2]/(confusion_out[2,1]+confusion_out[2,2]))
+FPR = (confusion_out[1,2]/(confusion_out[1,1]+confusion_out[1,2]))
+
+confusion_table[nrow(confusion_table)+1,] = c(x,TPR,FPR)
+}
+
+# Plotting the ROC curve
+confusion_table %>% ggplot(aes(FPR,TPR)) + geom_line(fill="steelblue") + labs(y= "True Positive Rate", x="False Positive Rate", title = "ROC Curve for Logit Model")+theme_linedraw() + geom_abline(slope=1,intercept = 0)
+
+# Calculating the AUC
+logit_auc = auc(y,log_pred)
+## .7701
+
+val_pred_log =predict(base_logit,newdata=valid_df, type = "response")
+write.csv(val_pred_log,"GLM_results.csv", row.names = FALSE)
+
+```
+
+# Gradient Boosting Machine Model (3)
+
+## Tuning
+To get the most out of the GBM model, I need to tune hyper-parameters "shrinkage factor", "interaction depth", and "number of trees". This is implemented by looping different levels of the parameters through a model performance function, which generates a table of AUCs across different tuning levels. From these tables, I select the levels that generate the highest AUC.
+```{r 3a, message=FALSE, warning=FALSE}
+
+## Tuning- Shrinkage factor
+## Inputs different levels of shrinkage factor, outputs a table of AUCs at those levels
+shrinakage_fac = c(.0001,.001,.01,.02,.03,.035,.4)
+auc_frame_gbm=foreach(x=shrinakage_fac, .combine='rbind')%do%{
+sf_gbm <- gbm(y ~ .,
+                 data = base_train,
+                 distribution = "bernoulli",
+                 n.trees = 1250,
+                 shrinkage = x, interaction.depth = 2, cv.folds = 3)
+
+sf_gbm_pred <- predict(sf_gbm,
+                       newdata = base_test,
+                       type="response",
+                       n.trees = 1250)
+
+gbm_auc = auc(y,sf_gbm_pred)
+} %>% as.data.frame
+## After a few tests, it appears that AUC peaks at ~.03
+
+## Tuning- Interaction Depth
+## Inputs different levels of interaction depth, outputs a table of AUCs at those levels
+int_dep = c(2,4,6,10,14,20)
+int_frame_gbm = foreach(x=int_dep, .combine='rbind')%do%{
+sf_gbm <- gbm(y ~ .,
+                 data = base_train,
+                 distribution = "bernoulli",
+                 n.trees = 1250,
+                 shrinkage = .035, interaction.depth = x, cv.folds = 4)
+
+sf_gbm_pred <- predict(sf_gbm,
+                       newdata = base_test,
+                       type="response",
+                       n.trees = 1250)
+
+gbm_auc = auc(y,sf_gbm_pred)
+} %>% as.data.frame
+## AUC peaks at interaction depth of 2
+
+
+## Tuning - Number of trees
+## Inputs different numbers of trees, outputs a table of AUCs at those levels
+ntrees = c(1000,1250,1500)
+tree_frame_gbm=foreach(x=ntrees, .combine='rbind')%do%{
+sf_gbm <- gbm(y ~ .,
+                 data = base_train,
+                 distribution = "bernoulli",
+                 n.trees = x,
+                 shrinkage = .035, interaction.depth = 2, cv.folds = 2)
+
+sf_gbm_pred <- predict(sf_gbm,
+                       newdata = base_test,
+                       type="response",
+                       n.trees = x)
+
+gbm_auc = auc(y,sf_gbm_pred)
+} %>% as.data.frame
+```
+
+## Model Specification
+From the tuning steps, I implement a GBM model with the number of trees set to 1250, the shrinkage rate of .035, the interaction depth of 2, with 3 cross validation folds. The binary target is modeled against every covariate we selected from the cleaning stage.
+
+```{r 3b, message=FALSE, warning=FALSE}
+
+## The model with the tuned parameters. 
+sf_gbm <- gbm(y ~ .,
+                 data = base_train,
+                 distribution = "bernoulli",
+                 n.trees = 1250,
+                 shrinkage = .035, interaction.depth = 2, cv.folds = 3)
+
+sf_gbm_pred <- predict(sf_gbm,
+                       newdata = base_test,
+                       type="response",
+                       n.trees = 1250)
+
+confusion_table_gbm = data.frame(fold_id=integer(),TPR=integer(),FPR=integer())
+
+# Looping across the sequence to generate receiving operater characteristic curve
+level = seq(0.1,.8,by=.01)
+confusion_level=foreach(x=level)%do%{
+yhat_test = ifelse(sf_gbm_pred > x,1,0)
+confusion_out = table(y=y, yhat = yhat_test)
+TPR = (confusion_out[2,2]/(confusion_out[2,1]+confusion_out[2,2]))
+FPR = (confusion_out[1,2]/(confusion_out[1,1]+confusion_out[1,2]))
+confusion_table_gbm[nrow(confusion_table_gbm)+1,] = c(x,TPR,FPR)
+}
+
+# Plotting the ROC curve
+confusion_table_gbm %>% ggplot(aes(FPR,TPR)) + geom_line(fill="steelblue") + labs(y= "True Positive Rate", x="False Positive Rate", title = "ROC Curve for GBM Model")+theme_linedraw() + geom_abline(slope=1,intercept = 0)
+
+# Calculating AUC
+gbm_auc = auc(y,sf_gbm_pred)
+# .8005
+
+val_pred_gbm =predict(sf_gbm,newdata=valid_df, type = "response")
+write.csv(val_pred_gbm,"NonGLM_results.csv", row.names = FALSE)
+
+```
+
+# Comparing Model Performance (4)
+With an AUC of .7701, the baseline logit model performs fairly on the testing data we withheld. Logit models are very useful, as they are easy to train, prove to be strong for classification problems out of the box, and robust in feature spaces where the distributions of variables are unclear. However, logit models are sensitive to multicollinearity. As the feature space grows, the likelihood of present multicollinearity increases, as such, they are best applied to smaller sets of variables.
+
+With an AUC of .8005, the GBM model outperforms the logit model by 3.9%.This is typical of modern ensemble techniques. The logit model is a single classification model, whereas, the GBM uses 1250 weak classification trees and iteratively combines results to create a strong classifier. The main costs of implementing GBM models is the greater use of compute and time modeling, in addition to the time and effort it takes to tune the model.
+```{r 4a, message=FALSE, warning=FALSE}
+Model <- c("Logit", "GBM")
+AUC <- c(".7701" , ".8005")
+vars_of_interest <- data.frame(Model, AUC)
+kable(vars_of_interest, caption = "Model Performance by AUC")
+```
+
+# Recommendation and Summary (5)
+If I was to make a recommendation on which model to use, it would generally depend on the intended use. However, logistic regressions have been used for binary classification for over 50 years. Ensemble methods are becoming more accessible, fast, and powerful over time. GBM will almost always outpeform single classifiers, and without even looking at specific scores, I would advocate for using more modern data science methods.
